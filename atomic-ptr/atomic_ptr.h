@@ -1,21 +1,23 @@
 /*
-Copyright 2002-2005 Joseph W. Seigh 
+   Copyright 2002-2013 Joseph W. Seigh 
 
-Permission to use, copy, modify and distribute this software
-and its documentation for any purpose and without fee is
-hereby granted, provided that the above copyright notice
-appear in all copies, that both the copyright notice and this
-permission notice appear in supporting documentation.  I make
-no representations about the suitability of this software for
-any purpose. It is provided "as is" without express or implied
-warranty.
----
-*/
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+ */
 
 //------------------------------------------------------------------------------
 // atomic_ptr -- C++ atomic lock-free reference counted smart pointer
 //
-// version -- 0.0.1 (pre-alpha)
+// version -- 0.0.x (pre-alpha)
 //
 //
 // memory visibility:
@@ -58,19 +60,36 @@ warranty.
 #define _ATOMIC_PTR_H
 
 #include <stdlib.h>
-#include <atomix.h>
+#include <stdatomic.h>
+
+// Membar defines for atomic_ptr load w/ memory_order_acquire semantics
+#define MEMBAR0 memory_order_acquire
+#define MEMBAR1 memory_order_relaxed
+// Membar defines for atomic_ptr load w/ memory_order_consume semantics
+//#define MEMBAR0 memory_order_consume
+//#define MEMBAR1 memory_order_consime
 
 template<typename T> class atomic_ptr;
 template<typename T> class local_ptr;
 template<typename T> class atomic_ptr_ref;
-//typedef const float ** (atomic_ptr<T>:: **)() atomic_null_t;
+
+// double word sized integer type to get around illogical c11 atomics restriction
+#if __SIZEOF_LONG__ == 8
+#define ival __int128
+#else
+#define ival int64_t
+#endif
+
 
 struct refcount {
 	long	ecount;	// ephemeral count
 	long	rcount;	// reference count
 };
 
-template<typename T> struct ref {
+//
+// Differential reference to allow race free access to reference count
+//
+template<typename T> struct differentialReference {
 	long	ecount; // ephemeral count
 	atomic_ptr_ref<T> *ptr;
 };
@@ -79,7 +98,7 @@ typedef void (*pool_put_t)(void *);
 
 
 //=============================================================================
-// atomic_ptr_ref
+// atomic_ptr_ref -- non intrusive reference count
 //
 //
 //=============================================================================
@@ -87,29 +106,21 @@ template<typename T> class atomic_ptr_ref {
 	friend class atomic_ptr<T>;
 	friend class local_ptr<T>;
 
-	public:
-
-		typedef atomic_ptr_ref<T> _t;
-
-		//typedef void (*pool_put_t)(atomic_ptr_ref<T> *);
-
 	private:
-
 		refcount	count;				// reference counts
 		T *			ptr;				// ptr to actual object
 		pool_put_t	pool;
 
 	public:
-
 		atomic_ptr_ref<T> * next;
 
 
-		atomic_ptr_ref(T * p = 0) {
+		atomic_ptr_ref(T * p = nullptr) {
 			count.ecount = 0;
 			count.rcount = 1;
 			ptr = p;
-			pool = 0;
-			next = 0;
+			pool = nullptr;
+			next = nullptr;
 		};
 
 
@@ -127,11 +138,25 @@ template<typename T> class atomic_ptr_ref {
 		// prevent late stores into deleted storage. An
 		// acquire membar is required if the reference counts
 		// go to zero to prevent early stores into a live object.
-		// _sync takes care of both without having to finese
-		// special cases for _rel and _acq.
 		//
-		// Adding references does not require membars.  This may
-		// be broken out into a separate routine in the future.
+		// Adding references does not require membars.
+		//----------------------------------------------------------------------
+		int adjust_mb(long xephemeralCount, long xreferenceCount) {
+			refcount oldval, newval;
+
+			oldval.ecount = count.ecount;
+			oldval.rcount = count.rcount;
+			do {
+				newval.ecount = oldval.ecount + xephemeralCount;
+				newval.rcount = oldval.rcount + xreferenceCount;
+			}
+			while (!atomic_compare_exchange_strong_explicit((ival*)&count, (ival*)&oldval, (ival)newval, memory_order_acq_rel, memory_order_relaxed));
+
+			return (newval.ecount == 0 && newval.rcount == 0) ? 0 : 1;
+		}
+
+		//----------------------------------------------------------------------
+		// adjust refcount w/o membar
 		//----------------------------------------------------------------------
 		int adjust(long xephemeralCount, long xreferenceCount) {
 			refcount oldval, newval;
@@ -141,9 +166,8 @@ template<typename T> class atomic_ptr_ref {
 			do {
 				newval.ecount = oldval.ecount + xephemeralCount;
 				newval.rcount = oldval.rcount + xreferenceCount;
-
 			}
-			while (atomic_cas_sync(&count, &oldval, &newval) == 0);
+			while (!atomic_compare_exchange_strong_explicit((ival*)&count, (ival*)&oldval, (ival)newval, memory_order_relaxed, memory_order_relaxed));
 
 			return (newval.ecount == 0 && newval.rcount == 0) ? 0 : 1;
 		}
@@ -160,14 +184,14 @@ template<typename T> class local_ptr {
 	friend class atomic_ptr<T>;
 	public:
 
-		local_ptr(T * obj = 0) {
-			if (obj != 0) {
+		local_ptr(T * obj = nullptr) {
+			if (obj != nullptr) {
 				refptr = new atomic_ptr_ref<T>(obj);
 				refptr->count.ecount = 1;
 				refptr->count.rcount = 0;
 			}
 			else
-				refptr = 0;
+				refptr = nullptr;
 		}
 
 		local_ptr(const local_ptr<T> & src) {
@@ -182,7 +206,7 @@ template<typename T> class local_ptr {
 		// recycled ref object
 		local_ptr(atomic_ptr_ref<T>  * src) {
 			refptr = src;
-			if (refptr != 0) {
+			if (refptr != nullptr) {
 				refptr->count.ecount = 1;
 				refptr->count.rcount = 0;
 			}
@@ -190,8 +214,8 @@ template<typename T> class local_ptr {
 		}
 
 		~local_ptr() {
-			if (refptr != 0 && refptr->adjust(-1, 0) == 0) {
-				if (refptr->pool == 0)
+			if (refptr != nullptr && refptr->adjust_mb(-1, 0) == 0) {
+				if (refptr->pool == nullptr)
 					delete refptr;
 				else
 					refptr->pool(refptr);		// recyle to pool
@@ -218,7 +242,7 @@ template<typename T> class local_ptr {
 
 
 		T * get() {
-			return (refptr != 0) ? atomic_load_depends(&(refptr->ptr)) : (T *)0;
+			return (refptr != nullptr) ? atomic_load_explicit(&refptr->ptr, MEMBAR1) : (T *)nullptr;
 		}
 
 		T * operator -> () { return get(); }
@@ -231,8 +255,8 @@ template<typename T> class local_ptr {
 		// refptr == rhd.refptr  iff  refptr->ptr == rhd.refptr->ptr
 		bool operator == (local_ptr<T> & rhd) { return (refptr == rhd.refptr);}
 		bool operator != (local_ptr<T> & rhd) { return (refptr != rhd.refptr);}
-		bool operator == (atomic_ptr<T> & rhd) { return (refptr == rhd.xxx.ptr);}
-		bool operator != (atomic_ptr<T> & rhd) { return (refptr != rhd.xxx.ptr);}
+		bool operator == (atomic_ptr<T> & rhd) { return (refptr == rhd.ref.ptr);}
+		bool operator != (atomic_ptr<T> & rhd) { return (refptr != rhd.ref.ptr);}
 
 		//-----------------------------------------------------------------
 		// set/get recycle pool methods
@@ -291,53 +315,53 @@ template<typename T> class atomic_ptr {
 	friend class local_ptr<T>;
 
 	protected:
-		ref<T>  xxx;
+		differentialReference<T>  ref;
 
 	public:
 
-		atomic_ptr(T * obj = 0) {
-			xxx.ecount = 0;
-			if (obj != 0) {
-				xxx.ptr = new atomic_ptr_ref<T>(obj);
+		atomic_ptr(T * obj = nullptr) {
+			ref.ecount = 0;
+			if (obj != nullptr) {
+				ref.ptr = new atomic_ptr_ref<T>(obj);
 			}
 			else
-				xxx.ptr = 0;
+				ref.ptr = nullptr;
 		}
 
 		atomic_ptr(local_ptr<T> & src) {	// copy constructor
-			xxx.ecount = 0;
-			if ((xxx.ptr = src.refptr) != 0)
-				xxx.ptr->adjust(0, +1);
+			ref.ecount = 0;
+			if ((ref.ptr = src.refptr) != nullptr)
+				ref.ptr->adjust(0, +1);
 		}
 
 		atomic_ptr(atomic_ptr<T> & src) {  // copy constructor
-			xxx.ecount = 0;
-			xxx.ptr = src.getrefptr();	// atomic 
+			ref.ecount = 0;
+			ref.ptr = src.getrefptr();	// atomic 
 
 			// adjust link count
-			if (xxx.ptr != 0)
-				xxx.ptr->adjust(-1, +1);	// atomic
+			if (ref.ptr != nullptr)
+				ref.ptr->adjust(-1, +1);	// atomic
 		}
 
 		// recycled ref objects
 		atomic_ptr(atomic_ptr_ref<T> * src) { // copy constructor
-			if (src != 0) {
+			if (src != nullptr) {
 				src->count.ecount = 0;
 				src->count.rcount = 1;
 			}
-			xxx.ecount = 0;
-			xxx.ptr = src;	// atomic 
+			ref.ecount = 0;
+			ref.ptr = src;	// atomic 
 		}
 
 
 		~atomic_ptr() {					// destructor
-			// membar.release
-			if (xxx.ptr != 0 && xxx.ptr->adjust(xxx.ecount, -1) == 0) {
-				// membar.acquire
-				if (xxx.ptr->pool == 0)
-					delete xxx.ptr;
+			atomic_thread_fence(memory_order_release);
+			if (ref.ptr != nullptr && ref.ptr->adjust_mb(ref.ecount, -1) == 0) {
+				atomic_thread_fence(memory_order_acquire);
+				if (ref.ptr->pool == nullptr)
+					delete ref.ptr;
 				else
-					xxx.ptr->pool(xxx.ptr);
+					ref.ptr->pool(ref.ptr);
 			}
 		}
 
@@ -369,15 +393,15 @@ template<typename T> class atomic_ptr {
 		inline local_ptr<T> operator * () { return local_ptr<T>(*this); }
 
 		bool operator == (T * rhd) {
-			if (rhd == 0)
-				return (xxx.ptr == 0);
+			if (rhd == nullptr)
+				return (ref.ptr == nullptr);
 			else
 				return (local_ptr<T>(*this) == rhd);
 		}
 
 		bool operator != (T * rhd) {
-			if (rhd == 0)
-				return (xxx.ptr != 0);
+			if (rhd == nullptr)
+				return (ref.ptr != nullptr);
 			else
 				return (local_ptr<T>(*this) != rhd);
 		}
@@ -388,16 +412,15 @@ template<typename T> class atomic_ptr {
 		bool operator != (atomic_ptr<T> & rhd) {return (local_ptr<T>(*this) != local_ptr<T>(rhd)); }
 
 		bool cas(local_ptr<T> cmp, atomic_ptr<T> xchg) {
-			ref<T> temp;
+			differentialReference<T> temp;
 			bool rc = false;
 
-			temp.ecount = xxx.ecount;
+			temp.ecount = ref.ecount;
 			temp.ptr = cmp.refptr;
 
-			// membar.release
 			do {
-				if (atomic_cas_rel(&xxx, &temp, &xchg.xxx) != 0) {
-					xchg.xxx = temp;
+				if (atomic_compare_exchange_strong_explicit(&ref, &temp, xchg.ref, memory_order_acq_rel, memory_order_relaxed)) {
+					xchg.ref = temp;
 					rc = true;
 					break;
 				}
@@ -421,34 +444,36 @@ template<typename T> class atomic_ptr {
 	//protected:
 		// atomic
 		void swap(atomic_ptr<T> & obj) {	// obj is local & non-shared
-			ref<T> temp;
+			/*
+			differentialReference<T> temp;
 
-			temp.ecount = xxx.ecount;
-			temp.ptr = xxx.ptr;
+			temp.ecount = ref.ecount;
+			temp.ptr = ref.ptr;
 
-			// membar.release
-			while(atomic_cas_rel(&xxx, &temp, &obj.xxx) == 0);
+			while(!atomic_compare_exchange_strong_explicit(&ref, &temp, obj.ref, memory_order_release, memory_order_relaxed));
 
-			obj.xxx.ecount = temp.ecount;
-			obj.xxx.ptr = temp.ptr;
+			obj.ref.ecount = temp.ecount;
+			obj.ref.ptr = temp.ptr;
+			*/
+			obj.ref = atomic_exchange_explicit(&ref, obj.ref, memory_order_release, memory_order_relaxed);
 		}
 
 	private:
 
 		// atomic
 		atomic_ptr_ref<T> * getrefptr() {
-			ref<T> oldval, newval;
+			differentialReference<T> oldval, newval;
 
-			oldval.ecount = xxx.ecount;
-			oldval.ptr = xxx.ptr;
+			oldval.ecount = ref.ecount;
+			oldval.ptr = ref.ptr;
 
 			do {
 				newval.ecount = oldval.ecount + 1;
 				newval.ptr = oldval.ptr;
 			}
-			while (atomic_cas(&xxx, &oldval, &newval) == 0);
+			while (!atomic_compare_exchange_strong_explicit(&ref, &oldval, newval, memory_order_relaxed, memory_order_relaxed));
 
-			return atomic_load_depends(&oldval.ptr);
+			return atomic_load_explicit(&oldval.ptr, MEMBAR0);
 		}
 
 }; // class atomic_ptr
